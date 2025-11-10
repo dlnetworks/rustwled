@@ -1,0 +1,1406 @@
+use anyhow::Result;
+use axum::{
+    extract::Json,
+    http::{header, StatusCode},
+    response::{Html, IntoResponse, Response},
+    routing::{get, post},
+    Router,
+};
+use clap::Parser;
+use colorgrad::Color;
+use crossterm::cursor::Show;
+use crossterm::event::{poll, read, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use crossterm::ExecutableCommand;
+use ddp_rs::connection::DDPConnection;
+use ddp_rs::protocol::{PixelConfig, ID};
+use notify::{Config, Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::Terminal;
+use serde::{Deserialize, Serialize};
+use std::io::{self, Write};
+use std::net::UdpSocket;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+
+#[derive(Parser, Debug)]
+#[command(
+    author,
+    version,
+    about = "Real-time bandwidth visualization on WLED LED strips via DDP protocol",
+    long_about = "Monitors network interface bandwidth and visualizes it in real-time on WLED LED strips.\n\
+                  Upload traffic is displayed on LEDs 0-599, download traffic on LEDs 600-1199.\n\
+                  Supports both linear and logarithmic scaling, custom color gradients, and remote gateway monitoring."
+)]
+struct Args {
+    /// Use logarithmic scale for bandwidth visualization
+    #[arg(short, long)]
+    log: Option<bool>,
+
+    /// Maximum bandwidth in Gbps
+    #[arg(short, long)]
+    max: Option<f64>,
+
+    /// LED colors (for both TX and RX unless overridden)
+    #[arg(short, long)]
+    color: Option<String>,
+
+    /// TX LED colors
+    #[arg(long)]
+    tx_color: Option<String>,
+
+    /// RX LED colors
+    #[arg(long)]
+    rx_color: Option<String>,
+
+    /// Remote SSH host
+    #[arg(short = 'H', long)]
+    host: Option<String>,
+
+    /// WLED device address
+    #[arg(short, long)]
+    wled_ip: Option<String>,
+
+    /// Network interface to monitor
+    #[arg(short = 'i', long = "int")]
+    interface: Option<String>,
+
+    /// Path to ifstat binary
+    #[arg(short = 'p', long = "path", default_value = "ifstat")]
+    ifstat_path: String,
+
+    /// Total number of LEDs
+    #[arg(short = 'L', long)]
+    leds: Option<usize>,
+
+    /// LED fill direction mode
+    #[arg(short = 'd', long)]
+    direction: Option<String>,
+
+    /// Swap TX and RX half assignments
+    #[arg(short = 's', long)]
+    swap: Option<bool>,
+
+    /// Test mode
+    #[arg(short = 't', long)]
+    test: Option<String>,
+
+    /// Quiet mode
+    #[arg(short = 'q', long)]
+    quiet: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BandwidthConfig {
+    max_gbps: f64,
+    color: String,
+    tx_color: String,
+    rx_color: String,
+    direction: String,
+    swap: bool,
+    animation_speed: f64,
+    scale_animation_speed: bool,
+    log_scale: bool,
+    wled_ip: String,
+    interface: String,
+    total_leds: usize,
+    use_gradient: bool,
+    interpolation: String,
+    fps: f64,
+    httpd_enabled: bool,
+    httpd_ip: String,
+    httpd_port: u16,
+}
+
+impl BandwidthConfig {
+    fn default() -> Self {
+        BandwidthConfig {
+            max_gbps: 10.0,
+            color: "0099FF".to_string(),
+            tx_color: "".to_string(),
+            rx_color: "".to_string(),
+            direction: "mirrored".to_string(),
+            swap: false,
+            animation_speed: 1.0,
+            scale_animation_speed: false,
+            log_scale: false,
+            wled_ip: "led.local".to_string(),
+            interface: "en0".to_string(),
+            total_leds: 1200,
+            use_gradient: true,
+            interpolation: "linear".to_string(),
+            fps: 60.0,
+            httpd_enabled: true,
+            httpd_ip: "0.0.0.0".to_string(),
+            httpd_port: 8080,
+        }
+    }
+
+    fn load_or_default() -> Self {
+        Self::load().unwrap_or_else(|_| Self::default())
+    }
+
+    fn merge_with_args(&mut self, args: &Args) {
+        // Only override config values if explicitly specified on command line
+        if let Some(ref color) = args.color {
+            self.color = color.clone();
+            // If -c is specified but --tx_color and --rx_color are not, clear them
+            if args.tx_color.is_none() {
+                self.tx_color = "".to_string();
+            }
+            if args.rx_color.is_none() {
+                self.rx_color = "".to_string();
+            }
+        }
+
+        // Individual TX/RX colors only set if explicitly specified
+        if let Some(ref tx_color) = args.tx_color {
+            self.tx_color = tx_color.clone();
+        }
+
+        if let Some(ref rx_color) = args.rx_color {
+            self.rx_color = rx_color.clone();
+        }
+
+        if let Some(max) = args.max {
+            self.max_gbps = max;
+        }
+
+        if let Some(ref direction) = args.direction {
+            self.direction = direction.clone();
+        }
+
+        if let Some(ref wled_ip) = args.wled_ip {
+            self.wled_ip = wled_ip.clone();
+        }
+
+        if let Some(ref interface) = args.interface {
+            self.interface = interface.clone();
+        }
+
+        if let Some(leds) = args.leds {
+            self.total_leds = leds;
+        }
+
+        if let Some(swap) = args.swap {
+            self.swap = swap;
+        }
+
+        if let Some(log) = args.log {
+            self.log_scale = log;
+        }
+    }
+
+    fn config_path() -> Result<PathBuf> {
+        let home = std::env::var("HOME")?;
+        let config_dir = PathBuf::from(home).join(".config").join("bandwidth_meter");
+        std::fs::create_dir_all(&config_dir)?;
+        Ok(config_dir.join("config.conf"))
+    }
+
+    fn load() -> Result<Self> {
+        let path = Self::config_path()?;
+        let contents = std::fs::read_to_string(path)?;
+        Ok(toml::from_str(&contents)?)
+    }
+
+    fn save(&self) -> Result<()> {
+        let path = Self::config_path()?;
+
+        // Build TOML with comments manually for better documentation
+        let contents = format!(
+            r#"# Bandwidth Meter Configuration File
+# Edit this file while the program is running to change settings in real-time
+# Note: Changes to wled_ip, interface, total_leds, and log_scale require restart
+
+# Maximum bandwidth in Gbps for visualization scaling
+max_gbps = {}
+
+# Default LED color (hex, applies to both TX and RX if not overridden)
+# Can be single color: "FF0000" or gradient: "FF0000,00FF00,0000FF"
+color = "{}"
+
+# TX (upload) LED colors (hex, overrides 'color' setting)
+# Can be single color: "FF0000" or gradient: "FF0000,00FF00,0000FF"
+tx_color = "{}"
+
+# RX (download) LED colors (hex, overrides 'color' setting)
+# Can be single color: "0000FF" or gradient: "0000FF,00FFFF,00FF00"
+rx_color = "{}"
+
+# LED fill direction mode
+# Options: "mirrored", "opposing", "left", "right"
+direction = "{}"
+
+# Swap TX and RX half assignments
+# Options: true, false
+swap = {}
+
+# Animation speed in LEDs per frame (0.0 = disabled, 1.0 = 60 LEDs/sec)
+# Controls how fast gradients travel along the strip
+animation_speed = {}
+
+# Scale animation speed based on bandwidth utilization
+# When enabled, speed scales from 0.0 (no traffic) to animation_speed (max bandwidth)
+# Options: true, false
+scale_animation_speed = {}
+
+# Use logarithmic scale for bandwidth visualization
+# Options: true, false
+log_scale = {}
+
+# WLED device IP address or hostname (requires restart to change)
+wled_ip = "{}"
+
+# Network interface to monitor (requires restart to change)
+# Can be single interface "eth0" or combined with comma "eth0,eth1"
+interface = "{}"
+
+# Total number of LEDs in the strip (requires restart to change)
+# TX uses first half (0-N/2), RX uses second half (N/2-N)
+total_leds = {}
+
+# Use gradient blending between colors
+# Options: true (smooth gradients), false (hard color segments)
+use_gradient = {}
+
+# Gradient interpolation mode (only applies when use_gradient = true)
+# Options: "linear" (sharp), "basis" (smooth B-spline), "catmullrom" (smooth Catmull-Rom)
+interpolation = "{}"
+
+# Rendering frame rate (can be changed while running)
+# Try different values like 30, 60, 120, 144 to reduce stuttering
+fps = {}
+
+# HTTP server configuration
+# Enable or disable the built-in web configuration interface
+httpd_enabled = {}
+
+# IP address for the HTTP server to listen on
+# Use "0.0.0.0" to listen on all interfaces, or "127.0.0.1" for localhost only
+httpd_ip = "{}"
+
+# Port for the HTTP server to listen on
+httpd_port = {}
+"#,
+            self.max_gbps,
+            self.color,
+            self.tx_color,
+            self.rx_color,
+            self.direction,
+            self.swap,
+            self.animation_speed,
+            self.scale_animation_speed,
+            self.log_scale,
+            self.wled_ip,
+            self.interface,
+            self.total_leds,
+            self.use_gradient,
+            self.interpolation,
+            self.fps,
+            self.httpd_enabled,
+            self.httpd_ip,
+            self.httpd_port,
+        );
+
+        std::fs::write(path, contents)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum InterpolationMode {
+    Linear,
+    Basis,
+    CatmullRom,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DirectionMode {
+    Mirrored,
+    Opposing,
+    Left,
+    Right,
+}
+
+// Shared state between main thread and render thread
+#[derive(Clone)]
+struct SharedRenderState {
+    current_rx_kbps: f64,
+    current_tx_kbps: f64,
+    animation_speed: f64,
+    scale_animation_speed: bool,
+    max_bandwidth_kbps: f64,
+
+    // Color configuration (as strings, renderer will rebuild gradients when changed)
+    tx_color: String,
+    rx_color: String,
+    use_gradient: bool,
+    interpolation_mode: InterpolationMode,
+
+    // Rendering configuration
+    direction: DirectionMode,
+    swap: bool,
+    use_log_scale: bool,
+    fps: f64,
+
+    // Generation counter to detect changes
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Rgb {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+impl Rgb {
+    fn from_hex(hex: &str) -> Result<Self> {
+        let hex = hex.trim_start_matches('#');
+        if hex.len() != 6 {
+            anyhow::bail!("Invalid hex color: {}", hex);
+        }
+        Ok(Rgb {
+            r: u8::from_str_radix(&hex[0..2], 16)?,
+            g: u8::from_str_radix(&hex[2..4], 16)?,
+            b: u8::from_str_radix(&hex[4..6], 16)?,
+        })
+    }
+}
+
+// Helper function to build gradient from color string
+fn build_gradient_from_color(
+    color_str: &str,
+    use_gradient: bool,
+    interpolation_mode: InterpolationMode,
+) -> Result<(Option<colorgrad::Gradient>, Vec<Rgb>, Rgb)> {
+    let hex_colors: Vec<&str> = color_str.split(',').map(|s| s.trim()).collect();
+
+    // Parse all colors into RGB
+    let mut rgb_colors = Vec::new();
+    for hex in hex_colors.iter() {
+        rgb_colors.push(Rgb::from_hex(hex)?);
+    }
+
+    // Build gradient only if we have multiple colors and use_gradient is enabled
+    let gradient = if rgb_colors.len() >= 2 && use_gradient {
+        let mut colorgrad_colors = Vec::new();
+        for rgb in rgb_colors.iter() {
+            colorgrad_colors.push(Color::from_rgba8(rgb.r, rgb.g, rgb.b, 255));
+        }
+
+        // Add first color at end to make gradient cyclic (seamless loop)
+        if let Some(first) = colorgrad_colors.first().cloned() {
+            colorgrad_colors.push(first);
+        }
+
+        let cg_interpolation = match interpolation_mode {
+            InterpolationMode::Basis => colorgrad::Interpolation::Basis,
+            InterpolationMode::CatmullRom => colorgrad::Interpolation::CatmullRom,
+            _ => colorgrad::Interpolation::Linear,
+        };
+
+        let gradient = colorgrad::CustomGradient::new()
+            .colors(&colorgrad_colors)
+            .interpolation(cg_interpolation)
+            .build()?;
+
+        Some(gradient)
+    } else {
+        None
+    };
+
+    let solid_color = if !rgb_colors.is_empty() {
+        rgb_colors[0]
+    } else {
+        // Default fallback
+        Rgb::from_hex("0099FF")?
+    };
+
+    Ok((gradient, rgb_colors, solid_color))
+}
+
+// Dedicated renderer that runs in its own thread at configurable FPS
+struct Renderer {
+    ddp_conn: DDPConnection,
+    shared_state: Arc<Mutex<SharedRenderState>>,
+    shutdown: Arc<AtomicBool>,
+
+    // Owned by renderer thread
+    animation_offset: f64,
+    total_leds: usize,
+    leds_per_direction: usize,
+
+    // Built from shared state
+    tx_gradient: Option<colorgrad::Gradient>,
+    rx_gradient: Option<colorgrad::Gradient>,
+    tx_colors: Vec<Rgb>,
+    rx_colors: Vec<Rgb>,
+    tx_solid_color: Rgb,
+    rx_solid_color: Rgb,
+
+    // Cache to detect when gradients need rebuilding
+    last_generation: u64,
+}
+
+impl Renderer {
+    fn new(
+        ddp_conn: DDPConnection,
+        shared_state: Arc<Mutex<SharedRenderState>>,
+        shutdown: Arc<AtomicBool>,
+        total_leds: usize,
+    ) -> Result<Self> {
+        let leds_per_direction = total_leds / 2;
+
+        // Lock shared state to get initial colors
+        let state = shared_state.lock().unwrap();
+        let (tx_gradient, tx_colors, tx_solid_color) =
+            build_gradient_from_color(&state.tx_color, state.use_gradient, state.interpolation_mode)?;
+        let (rx_gradient, rx_colors, rx_solid_color) =
+            build_gradient_from_color(&state.rx_color, state.use_gradient, state.interpolation_mode)?;
+        let last_generation = state.generation;
+        drop(state);
+
+        Ok(Renderer {
+            ddp_conn,
+            shared_state,
+            shutdown,
+            animation_offset: 0.0,
+            total_leds,
+            leds_per_direction,
+            tx_gradient,
+            rx_gradient,
+            tx_colors,
+            rx_colors,
+            tx_solid_color,
+            rx_solid_color,
+            last_generation,
+        })
+    }
+
+    fn rebuild_gradients_if_needed(&mut self) -> Result<()> {
+        let state = self.shared_state.lock().unwrap();
+
+        // Check if generation changed (config updated)
+        if state.generation != self.last_generation {
+            let (tx_gradient, tx_colors, tx_solid_color) =
+                build_gradient_from_color(&state.tx_color, state.use_gradient, state.interpolation_mode)?;
+            let (rx_gradient, rx_colors, rx_solid_color) =
+                build_gradient_from_color(&state.rx_color, state.use_gradient, state.interpolation_mode)?;
+
+            self.tx_gradient = tx_gradient;
+            self.tx_colors = tx_colors;
+            self.tx_solid_color = tx_solid_color;
+            self.rx_gradient = rx_gradient;
+            self.rx_colors = rx_colors;
+            self.rx_solid_color = rx_solid_color;
+            self.last_generation = state.generation;
+        }
+
+        Ok(())
+    }
+
+    fn calculate_leds(&self, bandwidth_kbps: f64, max_bandwidth_kbps: f64, use_log_scale: bool) -> usize {
+        if use_log_scale {
+            if bandwidth_kbps <= 0.0 {
+                return 0;
+            }
+            let log_bandwidth = bandwidth_kbps.log10();
+            let log_max = max_bandwidth_kbps.log10();
+            let log_min = 0.0;
+            let log_percentage = (log_bandwidth - log_min) / (log_max - log_min);
+            let leds = (log_percentage * self.leds_per_direction as f64) as usize;
+            leds.min(self.leds_per_direction).max(0)
+        } else {
+            let percentage = bandwidth_kbps / max_bandwidth_kbps;
+            let leds = (percentage * self.leds_per_direction as f64) as usize;
+            leds.min(self.leds_per_direction)
+        }
+    }
+
+    fn calculate_effective_speed(&self, state: &SharedRenderState) -> f64 {
+        if state.scale_animation_speed {
+            let tx_utilization = (state.current_tx_kbps / state.max_bandwidth_kbps).clamp(0.0, 1.0);
+            let rx_utilization = (state.current_rx_kbps / state.max_bandwidth_kbps).clamp(0.0, 1.0);
+            let max_utilization = tx_utilization.max(rx_utilization);
+
+            // Quantize to nice fractions to avoid aliasing/stuttering
+            let quantized = (max_utilization * 60.0).round() / 60.0;
+
+            state.animation_speed * quantized
+        } else {
+            state.animation_speed
+        }
+    }
+
+    fn calculate_led_positions(&self, tx_leds: usize, rx_leds: usize, direction: DirectionMode, swap: bool) -> (Vec<usize>, Vec<usize>) {
+        let half = self.leds_per_direction;
+
+        let (first_half_leds, second_half_leds) = if swap {
+            (tx_leds, rx_leds)
+        } else {
+            (rx_leds, tx_leds)
+        };
+
+        let (first_half_pos, second_half_pos) = match direction {
+            DirectionMode::Mirrored => {
+                let first: Vec<usize> = (0..first_half_leds).map(|i| half - 1 - i).collect();
+                let second: Vec<usize> = (0..second_half_leds).map(|i| half + i).collect();
+                (first, second)
+            }
+            DirectionMode::Opposing => {
+                let first: Vec<usize> = (0..first_half_leds).collect();
+                let second: Vec<usize> = (0..second_half_leds)
+                    .map(|i| self.total_leds - 1 - i)
+                    .collect();
+                (first, second)
+            }
+            DirectionMode::Left => {
+                let first: Vec<usize> = (0..first_half_leds).map(|i| half - 1 - i).collect();
+                let second: Vec<usize> = (0..second_half_leds)
+                    .map(|i| self.total_leds - 1 - i)
+                    .collect();
+                (first, second)
+            }
+            DirectionMode::Right => {
+                let first: Vec<usize> = (0..first_half_leds).collect();
+                let second: Vec<usize> = (0..second_half_leds).map(|i| half + i).collect();
+                (first, second)
+            }
+        };
+
+        if swap {
+            (first_half_pos, second_half_pos)
+        } else {
+            (second_half_pos, first_half_pos)
+        }
+    }
+
+    fn render_frame(&mut self, delta_seconds: f64) -> Result<()> {
+        // Rebuild gradients if config changed (very quick check)
+        self.rebuild_gradients_if_needed()?;
+
+        // Lock shared state only long enough to read current values
+        let state = self.shared_state.lock().unwrap();
+        let rx_kbps = state.current_rx_kbps;
+        let tx_kbps = state.current_tx_kbps;
+        let max_bandwidth_kbps = state.max_bandwidth_kbps;
+        let use_log_scale = state.use_log_scale;
+        let direction = state.direction;
+        let swap = state.swap;
+        let use_gradient = state.use_gradient;
+        let effective_speed = self.calculate_effective_speed(&state);
+        drop(state); // Release lock immediately
+
+        // Calculate LED counts
+        let rx_leds = self.calculate_leds(rx_kbps, max_bandwidth_kbps, use_log_scale);
+        let tx_leds = self.calculate_leds(tx_kbps, max_bandwidth_kbps, use_log_scale);
+
+        // Update animation offset
+        if effective_speed > 0.0 {
+            let leds_per_second = effective_speed * 60.0;
+            let offset_delta = (leds_per_second * delta_seconds) / self.leds_per_direction as f64;
+            self.animation_offset = (self.animation_offset + offset_delta) % 1.0;
+        }
+
+        // Prepare frame
+        let frame_size = self.total_leds * 3;
+        let mut frame = vec![0u8; frame_size];
+
+        let (tx_positions, rx_positions) = self.calculate_led_positions(tx_leds, rx_leds, direction, swap);
+
+        // Render TX positions
+        if !use_gradient && self.tx_colors.len() >= 2 {
+            let pattern_offset_leds = self.animation_offset * self.leds_per_direction as f64;
+            let segment_size = self.leds_per_direction as f64 / self.tx_colors.len() as f64;
+
+            for (i, &led_pos) in tx_positions.iter().enumerate() {
+                let pattern_pos = (i as f64 + pattern_offset_leds) % self.leds_per_direction as f64;
+                let segment_idx = (pattern_pos / segment_size).floor() as usize % self.tx_colors.len();
+                let color = &self.tx_colors[segment_idx];
+
+                let offset = led_pos * 3;
+                frame[offset] = color.r;
+                frame[offset + 1] = color.g;
+                frame[offset + 2] = color.b;
+            }
+        } else if let Some(ref tx_gradient) = self.tx_gradient {
+            for (i, &led_pos) in tx_positions.iter().enumerate() {
+                let pos_ratio = i as f64 / self.leds_per_direction as f64;
+                let animated_pos = (pos_ratio + self.animation_offset) % 1.0;
+
+                let rgba = tx_gradient.at(animated_pos).to_rgba8();
+                let offset = led_pos * 3;
+                frame[offset] = rgba[0];
+                frame[offset + 1] = rgba[1];
+                frame[offset + 2] = rgba[2];
+            }
+        } else {
+            for &led_pos in &tx_positions {
+                let offset = led_pos * 3;
+                frame[offset] = self.tx_solid_color.r;
+                frame[offset + 1] = self.tx_solid_color.g;
+                frame[offset + 2] = self.tx_solid_color.b;
+            }
+        }
+
+        // Render RX positions
+        if !use_gradient && self.rx_colors.len() >= 2 {
+            let pattern_offset_leds = self.animation_offset * self.leds_per_direction as f64;
+            let segment_size = self.leds_per_direction as f64 / self.rx_colors.len() as f64;
+
+            for (i, &led_pos) in rx_positions.iter().enumerate() {
+                let pattern_pos = (i as f64 + pattern_offset_leds) % self.leds_per_direction as f64;
+                let segment_idx = (pattern_pos / segment_size).floor() as usize % self.rx_colors.len();
+                let color = &self.rx_colors[segment_idx];
+
+                let offset = led_pos * 3;
+                frame[offset] = color.r;
+                frame[offset + 1] = color.g;
+                frame[offset + 2] = color.b;
+            }
+        } else if let Some(ref rx_gradient) = self.rx_gradient {
+            for (i, &led_pos) in rx_positions.iter().enumerate() {
+                let pos_ratio = i as f64 / self.leds_per_direction as f64;
+                let animated_pos = (pos_ratio + self.animation_offset) % 1.0;
+
+                let rgba = rx_gradient.at(animated_pos).to_rgba8();
+                let offset = led_pos * 3;
+                frame[offset] = rgba[0];
+                frame[offset + 1] = rgba[1];
+                frame[offset + 2] = rgba[2];
+            }
+        } else {
+            for &led_pos in &rx_positions {
+                let offset = led_pos * 3;
+                frame[offset] = self.rx_solid_color.r;
+                frame[offset + 1] = self.rx_solid_color.g;
+                frame[offset + 2] = self.rx_solid_color.b;
+            }
+        }
+
+        // Write to DDP connection
+        self.ddp_conn.write_offset(&frame, 0)?;
+
+        Ok(())
+    }
+
+    // Main render loop that runs at configurable FPS
+    fn run(mut self) {
+        let mut last_frame = Instant::now();
+
+        loop {
+            // Check for shutdown signal
+            if self.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // Read FPS from shared state
+            let fps = {
+                let state = self.shared_state.lock().unwrap();
+                state.fps
+            };
+
+            // Calculate frame duration based on FPS
+            let frame_duration_micros = (1_000_000.0 / fps) as u64;
+            let frame_duration = Duration::from_micros(frame_duration_micros);
+
+            let now = Instant::now();
+            let elapsed = now.duration_since(last_frame);
+
+            if elapsed >= frame_duration {
+                let delta_seconds = elapsed.as_secs_f64();
+                last_frame = now;
+
+                // Render frame - this is the only thing happening in this thread
+                let _ = self.render_frame(delta_seconds);
+            }
+
+            // Tiny sleep to avoid spinning CPU at 100%
+            thread::sleep(Duration::from_micros(100));
+        }
+    }
+}
+
+async fn spawn_ifstat(args: &Args, config: &BandwidthConfig) -> Result<tokio::process::Child> {
+    let use_total = config.interface.contains(',');
+
+    let child = if let Some(ref host) = args.host {
+        let ifstat_cmd = if use_total {
+            format!("ifstat -T -i {} -bn .1", config.interface)
+        } else {
+            format!("ifstat -i {} -bn .1", config.interface)
+        };
+
+        Command::new("ssh")
+            .arg(host)
+            .arg(ifstat_cmd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?
+    } else {
+        let mut cmd = Command::new(&args.ifstat_path);
+        if use_total {
+            cmd.arg("-T");
+        }
+        cmd.arg("-i")
+            .arg(&config.interface)
+            .arg("-bn")
+            .arg(".1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?
+    };
+
+    Ok(child)
+}
+
+fn parse_bandwidth_line(line: &str) -> Option<(f64, f64)> {
+    let parts: Vec<&str> = line.trim().split_whitespace().collect();
+    if parts.len() >= 2 {
+        let rx = parts[parts.len() - 2].parse::<f64>().ok()?;
+        let tx = parts[parts.len() - 1].parse::<f64>().ok()?;
+        Some((rx, tx))
+    } else {
+        None
+    }
+}
+
+fn parse_led_numbers(test_str: &str) -> Result<Vec<usize>> {
+    let mut leds = Vec::new();
+
+    for part in test_str.split(',') {
+        let part = part.trim();
+        if part.contains('-') {
+            let range_parts: Vec<&str> = part.split('-').collect();
+            if range_parts.len() == 2 {
+                let start = range_parts[0].parse::<usize>()?;
+                let end = range_parts[1].parse::<usize>()?;
+                for i in start..=end {
+                    leds.push(i);
+                }
+            }
+        } else {
+            leds.push(part.parse::<usize>()?);
+        }
+    }
+
+    Ok(leds)
+}
+
+async fn test_mode(args: &Args) -> Result<()> {
+    let test_str = args.test.as_ref().unwrap();
+    let led_numbers = parse_led_numbers(test_str)?;
+
+    let default_wled = "led.local".to_string();
+    let wled_ip = args.wled_ip.as_ref().unwrap_or(&default_wled);
+
+    println!("Test mode: blinking LEDs {:?}", led_numbers);
+    println!("Connecting to WLED at {}:4048", wled_ip);
+
+    let dest_addr = format!("{}:4048", wled_ip);
+    let socket = UdpSocket::bind("0.0.0.0:4048")?;
+    let mut ddp_conn =
+        DDPConnection::try_new(&dest_addr, PixelConfig::default(), ID::Default, socket)?;
+
+    println!("Connected! Starting blink loop...");
+
+    let test_color = Rgb::from_hex("FF0000")?;
+    let mut iteration = 0;
+
+    loop {
+        iteration += 1;
+        println!("\n=== Iteration {} ===", iteration);
+
+        println!("Turning ON LEDs {:?}", led_numbers);
+        let max_led = led_numbers.iter().max().copied().unwrap_or(0);
+        let frame_size = (max_led + 1) * 3;
+        let mut frame = vec![0u8; frame_size];
+
+        for &led_num in &led_numbers {
+            let offset = led_num * 3;
+            frame[offset] = test_color.r;
+            frame[offset + 1] = test_color.g;
+            frame[offset + 2] = test_color.b;
+        }
+
+        ddp_conn.write_offset(&frame, 0)?;
+        println!("Sent {} bytes starting at offset 0", frame.len());
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+        println!("Turning OFF LEDs");
+        let frame = vec![0u8; frame_size];
+        ddp_conn.write_offset(&frame, 0)?;
+        println!("Sent {} bytes of black", frame.len());
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    }
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    if args.test.is_some() {
+        // Test mode needs tokio runtime
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(test_mode(&args));
+    }
+
+    // Create tokio runtime for bandwidth reading task only - keep it alive for entire session
+    let _rt = tokio::runtime::Runtime::new()?;
+
+    // Setup terminal FIRST before ANYTHING else - this MUST be first to capture all output
+    enable_raw_mode()?;
+    let mut stdout_handle = io::stdout();
+    stdout_handle.execute(EnterAlternateScreen)?;
+    stdout_handle.flush()?;
+    let backend = CrosstermBackend::new(stdout_handle);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+    terminal.hide_cursor()?;
+
+    // Setup panic handler to ensure terminal cleanup
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = disable_raw_mode();
+        let _ = io::stdout().execute(LeaveAlternateScreen);
+        let _ = io::stdout().execute(Show);
+        original_hook(panic_info);
+    }));
+
+    // Load existing config or create default, then merge with command line args
+    let mut config = BandwidthConfig::load_or_default();
+    config.merge_with_args(&args);
+    config.save()?;
+    let config_path = BandwidthConfig::config_path()?;
+
+    // Create shared state for renderer
+    let tx_color = if config.tx_color.is_empty() {
+        config.color.clone()
+    } else {
+        config.tx_color.clone()
+    };
+    let rx_color = if config.rx_color.is_empty() {
+        config.color.clone()
+    } else {
+        config.rx_color.clone()
+    };
+
+    let interpolation_mode = match config.interpolation.to_lowercase().as_str() {
+        "basis" => InterpolationMode::Basis,
+        "catmullrom" | "catmull-rom" => InterpolationMode::CatmullRom,
+        _ => InterpolationMode::Linear,
+    };
+
+    let direction = match config.direction.to_lowercase().as_str() {
+        "mirrored" => DirectionMode::Mirrored,
+        "opposing" => DirectionMode::Opposing,
+        "left" => DirectionMode::Left,
+        "right" => DirectionMode::Right,
+        _ => DirectionMode::Mirrored,
+    };
+
+    // Create shutdown flag for clean termination
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    let shared_state = Arc::new(Mutex::new(SharedRenderState {
+        current_rx_kbps: 0.0,
+        current_tx_kbps: 0.0,
+        animation_speed: config.animation_speed,
+        scale_animation_speed: config.scale_animation_speed,
+        max_bandwidth_kbps: config.max_gbps * 1000.0 * 1000.0,
+        tx_color,
+        rx_color,
+        use_gradient: config.use_gradient,
+        interpolation_mode,
+        direction,
+        swap: config.swap,
+        use_log_scale: config.log_scale,
+        fps: config.fps,
+        generation: 0,
+    }));
+
+    // Create DDP connection for renderer
+    let dest_addr = format!("{}:4048", config.wled_ip);
+    let socket = match UdpSocket::bind("0.0.0.0:4048") {
+        Ok(s) => s,
+        Err(e) => {
+            terminal.show_cursor()?;
+            disable_raw_mode()?;
+            terminal.backend_mut().execute(LeaveAlternateScreen)?;
+            return Err(e.into());
+        }
+    };
+
+    let ddp_conn = match DDPConnection::try_new(&dest_addr, PixelConfig::default(), ID::Default, socket) {
+        Ok(conn) => conn,
+        Err(e) => {
+            terminal.show_cursor()?;
+            disable_raw_mode()?;
+            terminal.backend_mut().execute(LeaveAlternateScreen)?;
+            return Err(e.into());
+        }
+    };
+
+    // Create renderer
+    let renderer = match Renderer::new(ddp_conn, shared_state.clone(), shutdown.clone(), config.total_leds) {
+        Ok(r) => r,
+        Err(e) => {
+            terminal.show_cursor()?;
+            disable_raw_mode()?;
+            terminal.backend_mut().execute(LeaveAlternateScreen)?;
+            return Err(e);
+        }
+    };
+
+    // Spawn dedicated render thread - runs at 60 FPS independently
+    thread::spawn(move || {
+        renderer.run();
+    });
+
+    let child_result = _rt.block_on(spawn_ifstat(&args, &config));
+    let mut child = match child_result {
+        Ok(c) => c,
+        Err(e) => {
+            // Cleanup terminal before showing error
+            terminal.show_cursor()?;
+            disable_raw_mode()?;
+            terminal.backend_mut().execute(LeaveAlternateScreen)?;
+            return Err(e);
+        }
+    };
+
+    let (bandwidth_tx, bandwidth_rx) = mpsc::channel::<String>();
+    let (config_tx, config_rx) = mpsc::channel::<BandwidthConfig>();
+
+    // Message log stored locally
+    let mut messages: Vec<String> = Vec::new();
+    let quiet = args.quiet;
+
+    // Track previous LED counts for message generation
+    let mut prev_rx_leds: usize = 0;
+    let mut prev_tx_leds: usize = 0;
+    let leds_per_direction = config.total_leds / 2;
+
+    // Helper function to calculate LEDs (same logic as renderer)
+    let calculate_leds = |bandwidth_kbps: f64, max_bandwidth_kbps: f64, use_log_scale: bool| -> usize {
+        if use_log_scale {
+            if bandwidth_kbps <= 0.0 {
+                return 0;
+            }
+            let log_bandwidth = bandwidth_kbps.log10();
+            let log_max = max_bandwidth_kbps.log10();
+            let log_min = 0.0;
+            let log_percentage = (log_bandwidth - log_min) / (log_max - log_min);
+            let leds = (log_percentage * leds_per_direction as f64) as usize;
+            leds.min(leds_per_direction).max(0)
+        } else {
+            let percentage = bandwidth_kbps / max_bandwidth_kbps;
+            let leds = (percentage * leds_per_direction as f64) as usize;
+            leds.min(leds_per_direction)
+        }
+    };
+
+    // Add initial message
+    if !quiet {
+        messages.push(format!(
+            "Bandwidth meter started. Max: {} Gbps, Log scale: {}",
+            config.max_gbps, config.log_scale
+        ));
+        messages.push(format!(
+            "Interface: {}, LEDs: {}, WLED: {}",
+            config.interface, config.total_leds, config.wled_ip
+        ));
+        messages.push(format!("Config file: {}", config_path.display()));
+        messages.push("Edit config file to change settings while running".to_string());
+    }
+
+    // Spawn bandwidth reader in separate tokio task
+    let stdout = child.stdout.take().expect("Failed to capture stdout");
+    _rt.spawn(async move {
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            if bandwidth_tx.send(line).is_err() {
+                break; // Main thread dropped receiver, time to exit
+            }
+        }
+    });
+
+    // Spawn config file watcher thread
+    let config_path_clone = config_path.clone();
+    std::thread::spawn(move || -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = match RecommendedWatcher::new(tx, Config::default()) {
+            Ok(w) => w,
+            Err(_) => return Ok(()),
+        };
+
+        if watcher
+            .watch(&config_path_clone, RecursiveMode::NonRecursive)
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        loop {
+            match rx.recv() {
+                Ok(Ok(NotifyEvent { kind, .. })) => {
+                    // Only respond to modify events
+                    if matches!(kind, notify::EventKind::Modify(_)) {
+                        if let Ok(new_config) = BandwidthConfig::load() {
+                            let _ = config_tx.send(new_config);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Force initial render
+    {
+        let status_line = format!(
+            "Edit {} to change settings | Press Ctrl+C to quit",
+            config_path.display()
+        );
+
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(3)].as_ref())
+                .split(f.size());
+
+            let messages_text: Vec<Line> = messages
+                .iter()
+                .rev()
+                .take(chunks[0].height as usize)
+                .rev()
+                .map(|m| Line::from(m.as_str()))
+                .collect();
+
+            let messages_widget = Paragraph::new(messages_text).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Bandwidth Monitor"),
+            );
+            f.render_widget(messages_widget, chunks[0]);
+
+            let status = Paragraph::new(status_line)
+                .block(Block::default().borders(Borders::ALL).title("Status"));
+            f.render_widget(status, chunks[1]);
+        })?;
+    }
+
+    let mut needs_render = true;
+
+    // Simple main loop - just handle bandwidth and config updates
+    // Rendering happens in dedicated thread at configurable FPS
+    loop {
+        // Check for Ctrl+C key press (using crossterm events since we're in raw mode)
+        // Use 50ms timeout to make Ctrl+C more responsive
+        if poll(std::time::Duration::from_millis(50))? {
+            if let Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) = read()?
+            {
+                // Signal render thread to shut down
+                shutdown.store(true, Ordering::Relaxed);
+
+                // Give render thread a moment to exit cleanly
+                thread::sleep(Duration::from_millis(100));
+
+                // Clean up terminal
+                terminal.show_cursor()?;
+                disable_raw_mode()?;
+                terminal.backend_mut().execute(LeaveAlternateScreen)?;
+                break;
+            }
+        }
+
+        // Check bandwidth updates - update shared state
+        match bandwidth_rx.try_recv() {
+            Ok(line) => {
+                if let Some((rx_kbps, tx_kbps)) = parse_bandwidth_line(&line) {
+                    // Update shared state (non-blocking for renderer)
+                    {
+                        let mut state = shared_state.lock().unwrap();
+                        state.current_rx_kbps = rx_kbps;
+                        state.current_tx_kbps = tx_kbps;
+                    }
+
+                    // Generate messages for UI
+                    let rx_leds = calculate_leds(rx_kbps, config.max_gbps * 1000.0 * 1000.0, config.log_scale);
+                    let tx_leds = calculate_leds(tx_kbps, config.max_gbps * 1000.0 * 1000.0, config.log_scale);
+
+                    if rx_leds != prev_rx_leds {
+                        if !quiet {
+                            messages.push(format!(
+                                "RX: {} LEDs ({:.1} Mbps)",
+                                rx_leds,
+                                rx_kbps / 1000.0
+                            ));
+                            prev_rx_leds = rx_leds;
+                            needs_render = true;
+                        }
+                    }
+                    if tx_leds != prev_tx_leds {
+                        if !quiet {
+                            messages.push(format!(
+                                "TX: {} LEDs ({:.1} Mbps)",
+                                tx_leds,
+                                tx_kbps / 1000.0
+                            ));
+                            prev_tx_leds = tx_leds;
+                            needs_render = true;
+                        }
+                    }
+
+                    // Keep message buffer reasonable
+                    if messages.len() > 1000 {
+                        messages.remove(0);
+                    }
+                }
+            }
+            Err(_) => {
+                // No new bandwidth data
+            }
+        }
+
+        // Check config file updates
+        match config_rx.try_recv() {
+            Ok(new_config) => {
+                // Update shared state with new config
+                {
+                    let mut state = shared_state.lock().unwrap();
+
+                    // Handle color updates
+                    let color_changed = new_config.color != config.color;
+                    let tx_color_changed = new_config.tx_color != config.tx_color;
+                    let rx_color_changed = new_config.rx_color != config.rx_color;
+
+                    if tx_color_changed || (color_changed && new_config.tx_color.is_empty()) {
+                        let tx_color_to_use = if new_config.tx_color.is_empty() {
+                            new_config.color.clone()
+                        } else {
+                            new_config.tx_color.clone()
+                        };
+                        state.tx_color = tx_color_to_use.clone();
+                        state.generation += 1;
+                        if !quiet {
+                            if new_config.tx_color.is_empty() {
+                                messages.push(format!(
+                                    "TX color updated to: {} (from main color)",
+                                    tx_color_to_use
+                                ));
+                            } else {
+                                messages.push(format!("TX color updated to: {}", new_config.tx_color));
+                            }
+                        }
+                    }
+
+                    if rx_color_changed || (color_changed && new_config.rx_color.is_empty()) {
+                        let rx_color_to_use = if new_config.rx_color.is_empty() {
+                            new_config.color.clone()
+                        } else {
+                            new_config.rx_color.clone()
+                        };
+                        state.rx_color = rx_color_to_use.clone();
+                        state.generation += 1;
+                        if !quiet {
+                            if new_config.rx_color.is_empty() {
+                                messages.push(format!(
+                                    "RX color updated to: {} (from main color)",
+                                    rx_color_to_use
+                                ));
+                            } else {
+                                messages.push(format!("RX color updated to: {}", new_config.rx_color));
+                            }
+                        }
+                    }
+
+                    // Update max bandwidth
+                    if new_config.max_gbps != config.max_gbps {
+                        state.max_bandwidth_kbps = new_config.max_gbps * 1000.0 * 1000.0;
+                        prev_rx_leds = usize::MAX;
+                        prev_tx_leds = usize::MAX;
+                        if !quiet {
+                            messages.push(format!(
+                                "Max bandwidth updated to: {} Gbps",
+                                new_config.max_gbps
+                            ));
+                        }
+                    }
+
+                    // Update direction
+                    if new_config.direction != config.direction {
+                        let direction = match new_config.direction.to_lowercase().as_str() {
+                            "mirrored" => DirectionMode::Mirrored,
+                            "opposing" => DirectionMode::Opposing,
+                            "left" => DirectionMode::Left,
+                            "right" => DirectionMode::Right,
+                            _ => DirectionMode::Mirrored,
+                        };
+                        state.direction = direction;
+                        state.generation += 1;
+                        if !quiet {
+                            messages.push(format!("Direction updated to: {}", new_config.direction));
+                        }
+                    }
+
+                    // Update swap
+                    if new_config.swap != config.swap {
+                        state.swap = new_config.swap;
+                        state.generation += 1;
+                        prev_rx_leds = usize::MAX;
+                        prev_tx_leds = usize::MAX;
+                        if !quiet {
+                            messages.push(format!(
+                                "Swap: {}",
+                                if new_config.swap { "enabled" } else { "disabled" }
+                            ));
+                        }
+                    }
+
+                    // Update animation speed
+                    if new_config.animation_speed != config.animation_speed {
+                        state.animation_speed = new_config.animation_speed;
+                        if !quiet && new_config.animation_speed > 0.0 {
+                            messages.push(format!(
+                                "Animation speed: {:.3}",
+                                new_config.animation_speed
+                            ));
+                        }
+                    }
+
+                    // Update animation speed scaling
+                    if new_config.scale_animation_speed != config.scale_animation_speed {
+                        state.scale_animation_speed = new_config.scale_animation_speed;
+                        if !quiet {
+                            messages.push(format!(
+                                "Animation speed scaling: {}",
+                                if new_config.scale_animation_speed {
+                                    "enabled (scales with bandwidth)"
+                                } else {
+                                    "disabled (constant speed)"
+                                }
+                            ));
+                        }
+                    }
+
+                    // Update interpolation
+                    if new_config.interpolation != config.interpolation {
+                        let interpolation_mode = match new_config.interpolation.to_lowercase().as_str() {
+                            "basis" => InterpolationMode::Basis,
+                            "catmullrom" | "catmull-rom" => InterpolationMode::CatmullRom,
+                            _ => InterpolationMode::Linear,
+                        };
+                        state.interpolation_mode = interpolation_mode;
+                        state.generation += 1;
+                        if !quiet {
+                            messages.push(format!(
+                                "Interpolation updated to: {}",
+                                new_config.interpolation
+                            ));
+                        }
+                    }
+
+                    // Update gradient mode
+                    if new_config.use_gradient != config.use_gradient {
+                        state.use_gradient = new_config.use_gradient;
+                        state.generation += 1;
+                        if !quiet {
+                            messages.push(format!(
+                                "Gradient mode: {}",
+                                if new_config.use_gradient {
+                                    "enabled (smooth gradients)"
+                                } else {
+                                    "disabled (hard segments)"
+                                }
+                            ));
+                        }
+                    }
+                }
+
+                // Note: Changes to wled_ip, interface, total_leds, and log_scale require restart
+                if new_config.wled_ip != config.wled_ip
+                    || new_config.interface != config.interface
+                    || new_config.total_leds != config.total_leds
+                    || new_config.log_scale != config.log_scale
+                {
+                    if !quiet {
+                        messages.push("Note: wled_ip, interface, total_leds, or log_scale changed - restart required".to_string());
+                    }
+                }
+
+                // Update config for future comparisons
+                config = new_config;
+
+                needs_render = true;
+            }
+            Err(_) => {
+                // No config update
+            }
+        }
+
+        // Render only when something changed
+        if needs_render {
+            let status_text = format!(
+                "Edit {} to change settings | Press Ctrl+C to quit",
+                config_path.display()
+            );
+
+            terminal.draw(|f| {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(3)].as_ref())
+                    .split(f.size());
+
+                // Messages area
+                let messages_text: Vec<Line> = messages
+                    .iter()
+                    .rev()
+                    .take(chunks[0].height as usize)
+                    .rev()
+                    .map(|m| Line::from(m.as_str()))
+                    .collect();
+
+                let messages_widget = Paragraph::new(messages_text).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Bandwidth Monitor"),
+                );
+                f.render_widget(messages_widget, chunks[0]);
+
+                // Status/Input area
+                let status = Paragraph::new(status_text.clone())
+                    .block(Block::default().borders(Borders::ALL).title("Status"));
+                f.render_widget(status, chunks[1]);
+            })?;
+
+            needs_render = false;
+        }
+
+        // Small sleep to avoid busy-waiting CPU at 100%
+        // Renderer runs in separate thread, so main loop can sleep longer
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    Ok(())
+}
